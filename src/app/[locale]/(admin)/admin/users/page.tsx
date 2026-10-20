@@ -1,6 +1,6 @@
 import { db } from "@/db";
 import { users, creditPackages, videos } from "@/db/schema";
-import { eq, count, sql, desc } from "drizzle-orm";
+import { count, sql, desc, inArray } from "drizzle-orm";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Table,
@@ -67,29 +67,51 @@ export default async function UsersPage({ searchParams }: UsersPageProps) {
       .offset(offset);
   }
 
-  // 获取每个用户的统计信息
-  const usersWithStats = await Promise.all(
-    usersList.map(async (user) => {
-      const [videoCountResult, creditPackagesResult] = await Promise.all([
-        db.select({ count: count() }).from(videos).where(eq(videos.userId, user.id)),
-        db
-          .select({ count: count(), sum: sql<number>`COALESCE(SUM(${creditPackages.remainingCredits}), 0)` })
-          .from(creditPackages)
-          .where(eq(creditPackages.userId, user.id)),
-      ]);
+  // 批量聚合用户统计信息：消除 N+1。
+  // 原实现对每个用户单独发 2 条 SQL（视频数 + 积分包），一页 20 个用户 = 1 + 20*2 = 41 次往返；
+  // 改为用 IN (...) + GROUP BY 一次聚合当前页所有用户，仅需 2 条 SQL，数据库往返减少约 90%。
+  // videos.user_id 命中 videos_user_id_idx，credit_packages.user_id 命中 credit_packages_user_id_status_idx。
+  const userIds = usersList.map((u) => u.id);
 
-      const videoCount = videoCountResult[0]?.count || 0;
-      const packageCount = creditPackagesResult[0]?.count || 0;
-      const totalCredits = Number(creditPackagesResult[0]?.sum || 0);
+  let videoCountMap = new Map<string, number>();
+  let creditStatsMap = new Map<string, { count: number; total: number }>();
 
-      return {
-        ...user,
-        videoCount,
-        packageCount,
-        totalCredits,
-      };
-    }),
-  );
+  if (userIds.length > 0) {
+    const [videoCounts, creditStats] = await Promise.all([
+      // 一条 SQL 批量统计每个用户的视频数
+      db
+        .select({ userId: videos.userId, count: count() })
+        .from(videos)
+        .where(inArray(videos.userId, userIds))
+        .groupBy(videos.userId),
+
+      // 一条 SQL 批量统计每个用户的积分包数量与可用积分合计
+      db
+        .select({
+          userId: creditPackages.userId,
+          count: count(),
+          total: sql<number>`COALESCE(SUM(${creditPackages.remainingCredits}), 0)`,
+        })
+        .from(creditPackages)
+        .where(inArray(creditPackages.userId, userIds))
+        .groupBy(creditPackages.userId),
+    ]);
+
+    videoCountMap = new Map(videoCounts.map((r) => [r.userId, r.count]));
+    creditStatsMap = new Map(
+      creditStats.map((r) => [r.userId, { count: r.count, total: Number(r.total) }]),
+    );
+  }
+
+  const usersWithStats = usersList.map((user) => {
+    const pkg = creditStatsMap.get(user.id);
+    return {
+      ...user,
+      videoCount: videoCountMap.get(user.id) || 0,
+      packageCount: pkg?.count || 0,
+      totalCredits: pkg?.total || 0,
+    };
+  });
 
   return (
     <div className="space-y-6">
